@@ -3,3 +3,6 @@ __pycache__/
 *.pyc
 .env
 .pytest_cache/
+# Disposable domain cache is downloaded at runtime; do not commit the bulk file.
+data/disposable-domains.json
+data/disposable-domains.json.tmp

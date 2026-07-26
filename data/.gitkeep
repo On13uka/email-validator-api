@@ -1,0 +1,3 @@
+# This directory holds runtime data files.
+# - disposable-domains.json: auto-downloaded at startup (gitignored, ~1.3MB, refreshed weekly)
+# - role-accounts.json: static role-account local parts (committed)

@@ -1,0 +1,1 @@
+"""Make `tests/` an importable package so `from app import main` works."""
