@@ -6,3 +6,5 @@ __pycache__/
 # Disposable domain cache is downloaded at runtime; do not commit the bulk file.
 data/disposable-domains.json
 data/disposable-domains.json.tmp
+# Breach lookup cache (per-email, 7-day TTL). Never commit cached breach data.
+data/breach-cache/

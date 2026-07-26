@@ -1,4 +1,4 @@
-﻿"""Email Validator API - syntax + MX + SMTP + disposable + catch-all + role detection.
+﻿"""Email Validator API - syntax + MX + SMTP + disposable + catch-all + role + breach.
 
 Checks email validity in stages:
 1. Syntax validation (RFC 5322 compliant)
@@ -7,12 +7,17 @@ Checks email validity in stages:
 4. Disposable email domain detection (temp-mail providers)
 5. Catch-all (accept-all) domain detection (SMTP accepts any mailbox)
 6. Role-based account detection (admin@, info@, support@, ...)
+7. Email breach status via Have I Been Pwned (CC BY 4.0, attribution required)
 
-Free, no API key required. Uses dnspython for DNS, direct SMTP for mailbox check.
+Free, no API key required for the core pipeline. The breach feature needs a
+HIBP_API_KEY (https://haveibeenpwned.com/API/Key, from $4.39/mo Core tier) and
+degrades gracefully (breach_status=null + error field) when the key is missing.
 Disposable domain list: https://github.com/disposable-email-domains/disposable-email-domains (CC0).
+Breach data: Have I Been Pwned (https://haveibeenpwned.com) - CC BY 4.0.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import random
@@ -44,9 +49,10 @@ app = FastAPI(
     title="Email Validator API",
     description=(
         "Email validation: syntax, MX lookup, SMTP mailbox verify, "
-        "disposable domain detection, catch-all detection, role-based account detection."
+        "disposable domain detection, catch-all detection, role-based account detection, "
+        "and email breach status via Have I Been Pwned."
     ),
-    version="2.0.0",
+    version="2.1.0",
     lifespan=_lifespan,
 )
 
@@ -61,10 +67,70 @@ DISPOSABLE_LIST_URL = (
 )
 DISPOSABLE_REFRESH_DAYS = 7
 
+# HIBP breach integration (https://haveibeenpwned.com/API/v3)
+# Key is loaded from HIBP_API_KEY env var (set in .env or your platform's env).
+# When missing, the breach feature degrades gracefully: breach_status=null +
+# breach_status_error explaining the key is not configured. The endpoint never
+# crashes on a missing/invalid key.
+HIBP_API_BASE = "https://haveibeenpwned.com/api/v3"
+HIBP_TIMEOUT = 10  # seconds; never block the whole request on HIBP
+HIBP_CACHE_TTL_DAYS = 7  # breach data doesn't change minute-to-minute
+HIBP_ATTRIBUTION_URL = "https://haveibeenpwned.com"
+
 BASE_DIR = Path(__file__).resolve().parent.parent
 DATA_DIR = BASE_DIR / "data"
 DISPOSABLE_FILE = DATA_DIR / "disposable-domains.json"
 ROLE_FILE = DATA_DIR / "role-accounts.json"
+BREACH_CACHE_DIR = DATA_DIR / "breach-cache"
+
+
+def _load_env_file() -> dict[str, str]:
+    """Load F:/agent-runner/.env (or repo-local .env) into a dict.
+
+    Strips the UTF-8 BOM if present (the project .env is known to carry one).
+    Returns {} if no .env file is found. Does not override existing env vars.
+    """
+    candidates = [
+        BASE_DIR / ".env",
+        Path("F:/agent-runner/.env"),
+        Path(os.environ.get("AGENT_RUNNER_ENV", "")) if os.environ.get("AGENT_RUNNER_ENV") else None,
+    ]
+    env: dict[str, str] = {}
+    for path in candidates:
+        if path is None:
+            continue
+        try:
+            if not path.exists():
+                continue
+            raw = path.read_text(encoding="utf-8-sig")  # utf-8-sig strips BOM
+        except Exception:
+            continue
+        for line in raw.splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if "=" not in line:
+                continue
+            key, _, value = line.partition("=")
+            key = key.strip()
+            value = value.strip().strip('"').strip("'")
+            if key:
+                env[key] = value
+        if env:
+            break
+    return env
+
+
+def _get_hibp_api_key() -> str | None:
+    """Resolve the HIBP API key from os.environ first, then the .env file."""
+    key = os.environ.get("HIBP_API_KEY")
+    if key:
+        return key.strip() or None
+    env = _load_env_file()
+    key = env.get("HIBP_API_KEY")
+    if key:
+        return key.strip() or None
+    return None
 
 # RFC 5322 simplified regex
 _EMAIL_RE = re.compile(
@@ -106,6 +172,209 @@ def _load_role_accounts() -> set[str]:
             "mailerdaemon", "administrator",
         }
     return _role_set
+
+
+# ---------------------------------------------------------------------------
+# Email breach status via Have I Been Pwned (https://haveibeenpwned.com)
+# License: CC BY 4.0 - commercial use allowed WITH visible attribution + link.
+# We surface attribution in the response (_links.breach_data) and in the README
+# + landing page (required by the license).
+# ---------------------------------------------------------------------------
+_breach_cache_lock = threading.Lock()
+
+
+def _breach_cache_path(email: str) -> Path:
+    """Return the on-disk cache path for a given email (SHA-1 keyed)."""
+    digest = hashlib.sha1(email.strip().lower().encode("utf-8")).hexdigest()
+    return BREACH_CACHE_DIR / f"{digest}.json"
+
+
+def _read_breach_cache(email: str) -> dict[str, Any] | None:
+    """Return a cached breach payload if fresh, else None.
+
+    Cache file shape: {"fetched_at": iso, "payload": {...}}.
+    TTL = HIBP_CACHE_TTL_DAYS. Missing/corrupt files are treated as a miss.
+    """
+    path = _breach_cache_path(email)
+    try:
+        if not path.exists():
+            return None
+        with open(path, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        fetched_at = data.get("fetched_at")
+        payload = data.get("payload")
+        if not fetched_at or payload is None:
+            return None
+        ts = datetime.fromisoformat(fetched_at)
+        age_days = (datetime.now(timezone.utc) - ts).total_seconds() / 86400.0
+        if age_days > HIBP_CACHE_TTL_DAYS:
+            return None
+        return payload
+    except Exception:
+        return None
+
+
+def _write_breach_cache(email: str, payload: dict[str, Any]) -> None:
+    """Persist a breach payload to disk (best-effort, never raises)."""
+    try:
+        BREACH_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        path = _breach_cache_path(email)
+        tmp = path.with_suffix(".json.tmp")
+        record = {
+            "fetched_at": datetime.now(timezone.utc).isoformat(),
+            "payload": payload,
+        }
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(record, fh, ensure_ascii=True)
+        os.replace(tmp, path)
+    except Exception:
+        # Cache write failure must never break the request.
+        pass
+
+
+def _normalize_hibp_breach(raw: dict[str, Any]) -> dict[str, Any]:
+    """Project a raw HIBP breach object down to the fields we expose."""
+    return {
+        "name": raw.get("Name") or raw.get("name"),
+        "date": raw.get("BreachDate") or raw.get("date"),
+        "data_classes": raw.get("DataClasses") or raw.get("data_classes") or [],
+    }
+
+
+def _summarize_breaches(breaches: list[dict[str, Any]]) -> dict[str, Any]:
+    """Build the breach_status payload from a list of HIBP breach objects."""
+    dates = [b.get("BreachDate") or b.get("date") for b in breaches if (b.get("BreachDate") or b.get("date"))]
+    dates_sorted = sorted(dates)
+    return {
+        "breached": True,
+        "breach_count": len(breaches),
+        "breaches": [_normalize_hibp_breach(b) for b in breaches],
+        "first_breach_date": dates_sorted[0] if dates_sorted else None,
+        "last_breach_date": dates_sorted[-1] if dates_sorted else None,
+    }
+
+
+def _fetch_hibp_breach(email: str) -> dict[str, Any]:
+    """Call HIBP breachedaccount/{email} and return a breach_status payload.
+
+    Returns a dict shaped as the breach_status field (breached/breaches/...)
+    OR a degraded payload {"error": ..., "retry_after": ...} when the call
+    could not produce a clean result. The caller wraps this into the final
+    breach_status response shape.
+
+    Status code semantics (HIBP API v3):
+      200 -> breached; array of breach objects.
+      404 -> NOT breached (this is the good/no-breach case).
+      401/403 -> invalid/missing API key.
+      429 -> rate limited (honor Retry-After header).
+      other/timeout -> degraded.
+    """
+    import urllib.request
+    import urllib.error
+    import urllib.parse
+
+    api_key = _get_hibp_api_key()
+    if not api_key:
+        return {"error": "HIBP_API_KEY not configured"}
+
+    url = f"{HIBP_API_BASE}/breachedaccount/{urllib.parse.quote(email)}?truncateResponse=false"
+    req = urllib.request.Request(
+        url,
+        headers={
+            "hibp-api-key": api_key,
+            "User-Agent": "Email-Validator-API",
+            "Accept": "application/json",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=HIBP_TIMEOUT) as resp:  # nosec - hardcoded official HIBP URL
+            raw = resp.read().decode("utf-8")
+        breaches = json.loads(raw) if raw else []
+        if not isinstance(breaches, list):
+            breaches = []
+        return _summarize_breaches(breaches)
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            # Not breached - this is a clean "no breaches" result.
+            return {
+                "breached": False,
+                "breach_count": 0,
+                "breaches": [],
+                "first_breach_date": None,
+                "last_breach_date": None,
+            }
+        if e.code in (401, 403):
+            return {"error": "HIBP_API_KEY invalid or unauthorized"}
+        if e.code == 429:
+            retry_after = e.headers.get("Retry-After") if e.headers else None
+            out: dict[str, Any] = {"error": "HIBP rate limited"}
+            if retry_after:
+                out["retry_after"] = retry_after
+            return out
+        return {"error": f"HIBP HTTP {e.code}"}
+    except (urllib.error.URLError, TimeoutError, socket.timeout):
+        return {"error": "HIBP request timed out"}
+    except (json.JSONDecodeError, ValueError):
+        return {"error": "HIBP response parse error"}
+    except Exception:
+        return {"error": "HIBP request failed"}
+
+
+def get_breach_status(email: str) -> dict[str, Any] | None:
+    """Return the breach_status block for email, or null on hard failure.
+
+    Disk cache is checked first (7-day TTL). On a cache miss we call HIBP,
+    cache the result on success (200/404), and return the payload. The
+    caller is responsible for the is_trusted_identity composite signal.
+    """
+    addr = email.strip().lower()
+    if not addr:
+        return None
+
+    with _breach_cache_lock:
+        cached = _read_breach_cache(addr)
+    if cached is not None:
+        return cached
+
+    fetched = _fetch_hibp_breach(addr)
+    # Cache only clean results (breached or not-breached). Errors are NOT
+    # cached so the next request can retry immediately.
+    if "error" not in fetched:
+        with _breach_cache_lock:
+            _write_breach_cache(addr, fetched)
+        return fetched
+
+    # Degraded: surface the error to the caller but keep breach_status=null.
+    return {"error": fetched["error"], "retry_after": fetched.get("retry_after")}
+
+
+def _compute_is_trusted_identity(
+    smtp_verified: bool | None,
+    is_disposable: bool,
+    breach_status: dict[str, Any] | None,
+) -> bool | None:
+    """Composite 'is this a real person who has not been compromised' signal.
+
+    Returns True only when ALL of:
+      - smtp_verified is True (mailbox accepted mail)
+      - is_disposable is False (not a throwaway domain)
+      - breach_status.breached is False (not found in any known breach)
+    Returns False when any of those is definitively False.
+    Returns None when we cannot decide (breach_status is null/errored OR
+    smtp_verified is None) - callers should treat None as 'unknown'.
+    """
+    if smtp_verified is not True:
+        return False if smtp_verified is False else None
+    if is_disposable:
+        return False
+    if breach_status is None:
+        return None
+    if "error" in breach_status:
+        return None
+    breached = breach_status.get("breached")
+    if breached is None:
+        return None
+    return not breached
 
 
 def _refresh_disposable_list(force: bool = False) -> tuple[set[str], str]:
@@ -415,11 +684,15 @@ async def api_error_handler(request: Request, exc: APIError):
 async def root():
     return {
         "name": "Email Validator API",
-        "version": "2.0.0",
+        "version": "2.1.0",
         "endpoints": {
-            "validate": "/validate?email=user@example.com&smtp=true&catch_all=true",
+            "validate": "/validate?email=user@example.com&smtp=true&catch_all=true&breach=true",
             "health": "/health",
         },
+        "features": [
+            "syntax", "mx", "smtp", "disposable", "catch_all", "role",
+            "breach_status (Have I Been Pwned, CC BY 4.0)",
+        ],
         "docs": "/docs",
     }
 
@@ -427,6 +700,33 @@ async def root():
 @app.get("/health")
 async def health():
     return {"status": "ok"}
+
+
+def _build_breach_block(addr: str, want_breach: bool) -> tuple[dict[str, Any] | None, str | None, dict[str, Any]]:
+    """Compute the breach_status block + error + _links for a response.
+
+    Returns (breach_status, breach_status_error, _links).
+    - breach_status is None when want_breach is False or HIBP failed/missing key.
+    - breach_status_error is set only when want_breach is True but we could not
+      produce a clean breach_status (missing key, invalid key, rate limit,
+      timeout, etc.).
+    - _links always includes the HIBP attribution link when breach data is
+      surfaced (CC BY 4.0 requirement).
+    """
+    links: dict[str, Any] = {}
+    if not want_breach:
+        return None, None, links
+    raw = get_breach_status(addr)
+    if raw is None:
+        # Should not happen (get_breach_status always returns a dict), but guard.
+        return None, "breach lookup unavailable", links
+    if "error" in raw:
+        # Degraded: keep breach_status null, surface the error.
+        links["breach_data"] = HIBP_ATTRIBUTION_URL
+        return None, raw["error"], links
+    # Clean result - include attribution link (CC BY 4.0 requirement).
+    links["breach_data"] = HIBP_ATTRIBUTION_URL
+    return raw, None, links
 
 
 @app.get("/validate")
@@ -440,12 +740,23 @@ async def validate(
             "Adds one extra SMTP call when smtp=true. Ignored when smtp=false."
         ),
     ),
+    breach: bool = Query(
+        True,
+        description=(
+            "Look up email breach status via Have I Been Pwned (CC BY 4.0). "
+            "Adds one cached HTTP call to HIBP (10s timeout, 7-day disk cache). "
+            "Degrades to breach_status=null + breach_status_error when "
+            "HIBP_API_KEY is missing or the call fails. Set breach=false to "
+            "skip and only run bounce validation."
+        ),
+    ),
 ):
     addr = _normalize(email)
 
     # Stage 1: syntax
     syntax = _validate_syntax(addr)
     if not syntax["valid"]:
+        breach_status, breach_error, links = _build_breach_block(addr, breach)
         return {
             "email": addr,
             "valid": False,
@@ -459,9 +770,13 @@ async def validate(
             "role_type": None,
             "score": 0,
             "suggestion": None,
+            "breach_status": breach_status,
+            "breach_status_error": breach_error,
+            "is_trusted_identity": None,
             "syntax": syntax,
             "mx": None,
             "smtp": None,
+            "_links": links,
             "fetched_at": datetime.now(timezone.utc).isoformat(),
         }
 
@@ -484,6 +799,7 @@ async def validate(
             is_catch_all=None,
             is_role=is_role,
         )
+        breach_status, breach_error, links = _build_breach_block(addr, breach)
         return {
             "email": addr,
             "valid": False,
@@ -497,9 +813,13 @@ async def validate(
             "role_type": role_type,
             "score": score,
             "suggestion": None,
+            "breach_status": breach_status,
+            "breach_status_error": breach_error,
+            "is_trusted_identity": _compute_is_trusted_identity(None, is_disposable, breach_status),
             "syntax": syntax,
             "mx": mx,
             "smtp": None,
+            "_links": links,
             "fetched_at": datetime.now(timezone.utc).isoformat(),
         }
 
@@ -541,6 +861,13 @@ async def validate(
     # Disposable domains are valid emails but low-quality for marketing.
     # We surface a suggestion flag via the score; no typo correction yet.
 
+    # Stage 4: breach status (optional, additive). Run after the core
+    # pipeline so a slow/timing-out HIBP call never blocks bounce validation.
+    breach_status, breach_error, links = _build_breach_block(addr, breach)
+    is_trusted_identity = _compute_is_trusted_identity(
+        smtp_verified, is_disposable, breach_status
+    )
+
     return {
         "email": addr,
         "valid": valid,
@@ -554,9 +881,13 @@ async def validate(
         "role_type": role_type,
         "score": score,
         "suggestion": suggestion,
+        "breach_status": breach_status,
+        "breach_status_error": breach_error,
+        "is_trusted_identity": is_trusted_identity,
         "syntax": syntax,
         "mx": mx,
         "smtp": smtp_result,
         "catch_all_probe": catch_all_probe,
+        "_links": links,
         "fetched_at": datetime.now(timezone.utc).isoformat(),
     }
