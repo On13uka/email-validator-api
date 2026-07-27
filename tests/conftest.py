@@ -35,12 +35,24 @@ def _fake_mx_resolve(domain: str, rdtype: str, lifetime: int = 10):
             return [_FakeMX(10, "mail.mailinator.com.")]
         if domain == "catchall.example.com":
             return [_FakeMX(10, "mail.catchall.example.com.")]
+        if domain == "greylist.example.com":
+            return [_FakeMX(10, "mail.greylist.example.com.")]
+        if domain == "outlook.example.com":
+            # MX that points to outlook protection - used for provider ID test.
+            return [_FakeMX(10, "example-com.mail.protection.outlook.com.")]
         # Unknown domain -> NXDOMAIN
         from dns.resolver import NXDOMAIN
         raise NXDOMAIN()
     if rdtype == "A":
-        # A-record fallback used when no MX. Tests don't exercise this path.
-        return [_FakeMX(0, "1.2.3.4")]
+        # A-record fallback used when no MX. Only return an A record for
+        # known test domains; unknown domains get NXDOMAIN too so that
+        # mx_found is genuinely False for typo domains like gmial.com.
+        if domain in ("example.com", "gmail.com", "mailinator.com",
+                      "catchall.example.com", "greylist.example.com",
+                      "outlook.example.com"):
+            return [_FakeMX(0, "1.2.3.4")]
+        from dns.resolver import NXDOMAIN
+        raise NXDOMAIN()
     from dns.resolver import NoAnswer
     raise NoAnswer()
 
@@ -55,6 +67,10 @@ class _FakeSMTP:
       - Real mailbox (deterministic per domain) -> code 250
       - Anything else (the catch-all probe) -> controlled by
         self.catch_all flag.
+      - Greylisting: when self.greylist_mode is "always" or "once", a real
+        mailbox RCPT returns 451 instead of 250. "once" returns 451 on the
+        first call and 250 on subsequent calls; "always" returns 451 on
+        every call.
     """
 
     # Per-test configuration set by the fixtures below.
@@ -67,6 +83,11 @@ class _FakeSMTP:
         self.last_rcpt = None
         # Default behavior: real mailboxes accepted, catch-all probe rejected.
         self.catch_all = False
+        # Greylisting simulation. "off" = no 451s. "once" = first real-mailbox
+        # RCPT returns 451, then 250. "always" = every real-mailbox RCPT
+        # returns 451.
+        self.greylist_mode = "off"
+        self._rcpt_call_count = 0
 
     def __enter__(self):
         return self
@@ -97,6 +118,14 @@ class _FakeSMTP:
         local, _, domain = addr.partition("@")
         valid_local = _REAL_MAILBOXES.get(domain)
         if valid_local and local == valid_local:
+            # Greylisting simulation for real mailboxes.
+            if self.greylist_mode == "always":
+                return (451, b"4.7.1 greylisted, try again later")
+            if self.greylist_mode == "once":
+                self._rcpt_call_count += 1
+                if self._rcpt_call_count == 1:
+                    return (451, b"4.7.1 greylisted, try again later")
+                return (250, b"ok")
             return (250, b"ok")
         return (550, b"no such mailbox")
 
@@ -110,6 +139,8 @@ _REAL_MAILBOXES = {
     "gmail.com": "john.doe",
     "mailinator.com": "anything",  # disposable - mailbox result is irrelevant
     "catchall.example.com": "realuser",
+    "greylist.example.com": "user",
+    "outlook.example.com": "user",
 }
 
 
@@ -131,6 +162,13 @@ def fake_smtp(monkeypatch):
 
     monkeypatch.setattr(evmain.smtplib, "SMTP", _factory)
     return instance
+
+
+@pytest.fixture
+def no_greylist_wait(monkeypatch):
+    """Make the greylisting retry wait 0s so tests stay fast."""
+    monkeypatch.setattr(evmain, "GREYLIST_WAIT_SECONDS", 0)
+    return evmain
 
 
 @pytest.fixture
@@ -160,6 +198,15 @@ def isolated_role_data(tmp_path, monkeypatch):
     monkeypatch.setattr(evmain, "ROLE_FILE", tmp_roles)
     monkeypatch.setattr(evmain, "_role_set", None)
     return tmp_roles
+
+
+@pytest.fixture
+def reset_domain_datasets(monkeypatch):
+    """Reset the lazy-loaded popular/free-email domain caches so tests always
+    re-read the real data files (or whichever path the test has patched in)."""
+    monkeypatch.setattr(evmain, "_popular_domains", None)
+    monkeypatch.setattr(evmain, "_free_email_domains", None)
+    return evmain
 
 
 @pytest.fixture

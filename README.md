@@ -6,8 +6,10 @@
 
 Multi-stage email validation: syntax check, MX record lookup, optional SMTP
 mailbox verification, **disposable email detection**, **catch-all (accept-all)
-detection**, **role-based account detection**, and **email breach status via
-Have I Been Pwned**. Returns a 0-100 deliverability score and a composite
+detection**, **role-based account detection**, **email breach status via
+Have I Been Pwned**, **syntax suggestion ("did you mean...")**, **free-email
+provider flag + backend provider identification via MX**, and **greylisting
+detection**. Returns a 0-100 deliverability score and a composite
 `is_trusted_identity` signal combining all of the above.
 
 > **Only free email validator with breach status.** Every other validator
@@ -58,6 +60,10 @@ curl "https://your-app.onrender.com/validate?email=test@gmail.com&smtp=true&catc
   "role_type": null,
   "score": 100,
   "suggestion": null,
+  "is_free_email": false,
+  "email_provider": "other",
+  "is_greylisted": false,
+  "greylisting_note": null,
   "breach_status": {
     "breached": true,
     "breach_count": 2,
@@ -87,12 +93,53 @@ curl "https://your-app.onrender.com/validate?email=test@gmail.com&smtp=true&catc
 }
 ```
 
+**Response with a typo (did-you-mean suggestion):**
+
+```json
+{
+  "email": "alice@gmial.com",
+  "valid": false,
+  "stage": "mx",
+  "syntax_valid": true,
+  "mx_found": false,
+  "suggestion": "alice@gmail.com",
+  "is_free_email": false,
+  "email_provider": null,
+  ...
+}
+```
+
+**Response with a free-email provider and MX-based identification:**
+
+```json
+{
+  "email": "john.doe@gmail.com",
+  "valid": true,
+  "is_free_email": true,
+  "email_provider": "googleworkspace",
+  ...
+}
+```
+
+**Response when the SMTP server greylists:**
+
+```json
+{
+  "email": "user@example.com",
+  "valid": true,
+  "smtp_verified": false,
+  "is_greylisted": true,
+  "greylisting_note": "This domain uses greylisting - temporary rejection of incoming mail. The mailbox may still be valid; retry later.",
+  ...
+}
+```
+
 ### Field reference
 
 | Field | Type | Meaning |
 |-------|------|---------|
 | `email` | string | Normalized email address (lowercased) |
-| `valid` | bool | Overall validity: syntax OK and (MX found) and (SMTP not rejected) |
+| `valid` | bool | Overall validity: syntax OK and (MX found) and (SMTP not rejected, except greylisted 451s which are inconclusive) |
 | `stage` | string | Last stage reached: `syntax`, `mx`, or `smtp` |
 | `syntax_valid` | bool | RFC 5322 syntax valid |
 | `mx_found` | bool | Domain has MX records (or A-record fallback) |
@@ -102,7 +149,11 @@ curl "https://your-app.onrender.com/validate?email=test@gmail.com&smtp=true&catc
 | `is_role` | bool | Local part is a role account (`admin@`, `info@`, `support@`, ...) |
 | `role_type` | string / null | The matched role name (e.g. `admin`, `info`), or `null` |
 | `score` | int (0-100) | Deliverability score combining all signals (see formula below) |
-| `suggestion` | string / null | Reserved for future typo correction. Currently always `null` |
+| `suggestion` | string / null | Did-you-mean correction. When the domain looks like a typo of a popular provider (Levenshtein distance <=2 against ~500 popular domains), returns the corrected email (e.g. `alice@gmial.com` -> `alice@gmail.com`). `null` when no close match or the domain is already a popular domain. |
+| `is_free_email` | bool | `true` when the domain is a known free-email provider (gmail.com, yahoo.com, outlook.com, hotmail.com, icloud.com, proton.me, mail.ru, yandex.ru, zoho.com, gmx.com, ... ~100 domains). Useful for B2B-vs-B2C lead segmentation. |
+| `email_provider` | string / null | Backend mail provider identified from MX records. One of: `googleworkspace` (`*.google.com`), `microsoft365` (`*.mail.protection.outlook.com`), `protonmail` (`*.protonmail.ch` / `*.proton.me`), `zoho` (`*.zoho.com`), `yandex` (`*.yandex.ru` / `*.yandex.net`), `mailru` (`*.mail.ru`), `amazon_ses` (`*.amazonses.com`), `sendgrid` (`*.sendgrid.net`), `other` (MX present but unrecognized), `null` (no MX). Useful for fraud detection (e.g. protonmail = privacy-conscious). |
+| `is_greylisted` | bool / null | `true` when the SMTP server returned a 451 temporary failure on BOTH the initial RCPT TO and a retry after a 5-second wait (the standard short greylisting window). `false` when no 451 occurred, or when a 451 was followed by a successful retry. `null` when SMTP was not run (`smtp=false`). |
+| `greylisting_note` | string / null | Plain-English explanation when `is_greylisted=true`: "This domain uses greylisting - temporary rejection of incoming mail. The mailbox may still be valid; retry later." `null` otherwise. |
 | `breach_status` | object / null | Email breach status from Have I Been Pwned. `null` when `breach=false` or when the HIBP lookup failed/missing key (see `breach_status_error`) |
 | `breach_status_error` | string / null | Set when `breach=true` but `breach_status` is null. Values: `HIBP_API_KEY not configured`, `HIBP_API_KEY invalid or unauthorized`, `HIBP rate limited`, `HIBP request timed out`, etc. |
 | `is_trusted_identity` | bool / null | Composite "is this a real person who hasn't been compromised" signal. `true` only when `smtp_verified=true` AND `is_disposable=false` AND `breach_status.breached=false`. `false` when any is definitively false. `null` when unknown (breach lookup failed or SMTP not run). |
@@ -268,16 +319,88 @@ This API satisfies the attribution requirement in three places:
 
 Returns `{"status": "ok"}`.
 
+### Syntax suggestion ("did you mean...")
+
+When the domain in an email looks like a typo of a popular provider, the API
+returns a `suggestion` field with the corrected email. This uses Levenshtein
+distance (via stdlib `difflib.get_close_matches`) against a curated list of
+~500 popular email domains stored in `data/popular-email-domains.json`
+(gmail.com, yahoo.com, outlook.com, hotmail.com, icloud.com, proton.me,
+mail.ru, yandex.ru, zoho.com, gmx.com, ...).
+
+- Only suggests when the domain is NOT already a popular domain (no point
+  suggesting `gmail.com` for `gmail.com`).
+- Matches within Levenshtein distance ~2 (difflib cutoff 0.8).
+- Example: `alice@gmial.com` -> `suggestion: "alice@gmail.com"`.
+- Returns `null` when no close match is found.
+
+### Free-email-provider flag + provider identification via MX
+
+Two new fields help with lead segmentation (B2B vs B2C) and fraud detection:
+
+- `is_free_email: true` when the domain is in the free-email set
+  (`data/free-email-domains.json`, ~100 domains: gmail/yahoo/outlook/hotmail/
+  icloud/proton/mail.ru/yandex/zoho/gmx/...). Marketers use this to filter
+  out free-mail users from B2B lead lists.
+- `email_provider` identifies the backend mail provider from MX records:
+  - `googleworkspace` - MX points to `*.google.com` / `l.google.com`
+  - `microsoft365` - MX points to `*.mail.protection.outlook.com`
+  - `protonmail` - MX points to `*.protonmail.ch` / `*.proton.me`
+  - `zoho` - MX points to `*.zoho.com`
+  - `yandex` - MX points to `*.yandex.ru` / `*.yandex.net`
+  - `mailru` - MX points to `*.mail.ru`
+  - `amazon_ses` - MX points to `*.amazonses.com`
+  - `sendgrid` - MX points to `*.sendgrid.net`
+  - `other` - MX present but doesn't match a known pattern
+  - `null` - no MX records (or A-record fallback only)
+
+Fraud-detection use case: `email_provider: "protonmail"` flags a
+privacy-conscious user; `email_provider: "googleworkspace"` on a custom
+domain confirms a real business.
+
+### Greylisting detection
+
+Greylisting is a common anti-spam technique where the receiving mail server
+returns a **451 "temporary failure"** on the first delivery attempt from an
+unknown sender, then accepts the mail on a retry after a short wait. This
+makes SMTP mailbox verification unreliable for greylisted domains — the
+mailbox may be perfectly valid even though the first RCPT TO returned 451.
+
+When `smtp=true` and the SMTP server returns a 451, the API:
+
+1. Waits **5 seconds** (the standard short greylisting window).
+2. Retries the RCPT TO **once** (we never retry more than once — be polite).
+3. If the retry still returns 451, sets `is_greylisted: true` and includes a
+   `greylisting_note` explaining what greylisting is for non-technical users:
+   *"This domain uses greylisting - temporary rejection of incoming mail.
+   The mailbox may still be valid; retry later."*
+4. If the retry succeeds (250/251), sets `is_greylisted: false` and
+   `smtp_verified: true` — the mailbox verified after the retry.
+
+> **Timing note:** the greylisting retry adds up to ~5s + one extra SMTP
+> timeout on top of the normal SMTP stage. If the first SMTP call took 10s,
+> the total worst case for the SMTP stage is ~25s (10s + 5s wait + 10s
+> retry). Set `smtp=false` if you need a hard latency cap.
+
+When `is_greylisted=true`, the API keeps `valid=true` (the 451 is
+inconclusive, not a definitive rejection) and surfaces `is_greylisted` so
+the caller can decide whether to retry later. The catch-all probe is
+skipped when greylisting is active (it would just hit 451 too).
+
 ## Stages
 
 | Stage | What it checks | Fails on |
 |-------|---------------|----------|
 | syntax | RFC 5322 format | Bad format, too long |
 | mx | DNS MX records for domain | Domain can't receive mail |
-| smtp | SMTP RCPT TO command | Mailbox doesn't exist (optional) |
+| smtp | SMTP RCPT TO command (+ 451 greylisting retry) | Mailbox doesn't exist (optional) |
 | disposable | Domain in disposable list | Temporary email provider |
 | catch_all | SMTP accepts random fake mailbox | Mailbox verification unreliable |
 | role | Local part in role-accounts set | Not a personal mailbox |
+| suggestion | Levenshtein against ~500 popular domains | Typo of a popular provider |
+| free_email | Domain in free-email set | Free provider (gmail/yahoo/outlook/...) |
+| provider | MX host pattern matching | Backend mail provider identification |
+| greylisting | SMTP 451 -> retry once after 5s | Greylisted domain (retry later) |
 | breach | HIBP breachedaccount lookup | Email appeared in a known data breach (optional, `breach=true`) |
 
 ## Local development
@@ -311,10 +434,10 @@ pytest tests/ -q
 ```
 
 Tests are hermetic — DNS, SMTP, and HIBP HTTP are all mocked, no network calls.
-13 tests cover the core pipeline (7) and the breach feature (6):
-breach-with-breaches, breach-no-breaches (HIBP 404), missing-key graceful
-degradation, `is_trusted_identity` logic, cache hit (zero HTTP on second call),
-and `breach=false` opt-out.
+26 tests cover the core pipeline (7), the breach feature (6), and the v2.2.0
+table-stakes features (13): syntax suggestion (3), free-email flag (2),
+provider identification (4), and greylisting detection (4). The greylisting
+retry wait is patched to 0s in tests so the suite stays fast.
 
 ## Available on RapidAPI
 

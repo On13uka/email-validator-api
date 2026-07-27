@@ -1,4 +1,5 @@
-﻿"""Email Validator API - syntax + MX + SMTP + disposable + catch-all + role + breach.
+﻿"""Email Validator API - syntax + MX + SMTP + disposable + catch-all + role + breach
++ syntax suggestion + free-email/provider identification + greylisting detection.
 
 Checks email validity in stages:
 1. Syntax validation (RFC 5322 compliant)
@@ -8,6 +9,9 @@ Checks email validity in stages:
 5. Catch-all (accept-all) domain detection (SMTP accepts any mailbox)
 6. Role-based account detection (admin@, info@, support@, ...)
 7. Email breach status via Have I Been Pwned (CC BY 4.0, attribution required)
+8. Syntax suggestion ("did you mean...") via Levenshtein on a popular-domain list
+9. Free-email-provider flag + backend provider identification via MX
+10. Greylisting detection (SMTP 451 -> retry once after 5s)
 
 Free, no API key required for the core pipeline. The breach feature needs a
 HIBP_API_KEY (https://haveibeenpwned.com/API/Key, from $4.39/mo Core tier) and
@@ -17,6 +21,7 @@ Breach data: Have I Been Pwned (https://haveibeenpwned.com) - CC BY 4.0.
 """
 from __future__ import annotations
 
+import difflib
 import hashlib
 import json
 import os
@@ -50,9 +55,11 @@ app = FastAPI(
     description=(
         "Email validation: syntax, MX lookup, SMTP mailbox verify, "
         "disposable domain detection, catch-all detection, role-based account detection, "
-        "and email breach status via Have I Been Pwned."
+        "email breach status via Have I Been Pwned, syntax suggestion (did you mean...), "
+        "free-email-provider flag with backend provider identification, "
+        "and greylisting detection."
     ),
-    version="2.1.0",
+    version="2.2.0",
     lifespan=_lifespan,
 )
 
@@ -77,11 +84,29 @@ HIBP_TIMEOUT = 10  # seconds; never block the whole request on HIBP
 HIBP_CACHE_TTL_DAYS = 7  # breach data doesn't change minute-to-minute
 HIBP_ATTRIBUTION_URL = "https://haveibeenpwned.com"
 
+# Greylisting (RFC 7504 / common MTA behavior): when the SMTP RCPT TO returns
+# a 451 "temporary failure", the sender is expected to retry after a short
+# window. We retry ONCE after GREYLIST_WAIT_SECONDS and, if it still returns
+# 451, mark is_greylisted=true. The extra wait is added on top of the normal
+# SMTP timeout, so a request that already took 10s can take up to 15s total.
+# We never retry more than once (be polite to the receiving MTA).
+GREYLIST_WAIT_SECONDS = 5
+GREYLIST_SMTP_CODE = 451  # Requested action aborted: local error in processing
+
+# Suggestion (did you mean...) config. We use difflib.get_close_matches against
+# a curated list of popular email domains. Max edit distance is implicit in
+# difflib's cutoff (0.8 similarity ~ Levenshtein distance 1-2 for short
+# domains); we restrict the candidate cutoff so only very-close matches win.
+SUGGESTION_CUTOFF = 0.8  # difflib similarity ratio threshold
+SUGGESTION_N = 1         # return the single best match
+
 BASE_DIR = Path(__file__).resolve().parent.parent
 DATA_DIR = BASE_DIR / "data"
 DISPOSABLE_FILE = DATA_DIR / "disposable-domains.json"
 ROLE_FILE = DATA_DIR / "role-accounts.json"
 BREACH_CACHE_DIR = DATA_DIR / "breach-cache"
+POPULAR_DOMAINS_FILE = DATA_DIR / "popular-email-domains.json"
+FREE_EMAIL_DOMAINS_FILE = DATA_DIR / "free-email-domains.json"
 
 
 def _load_env_file() -> dict[str, str]:
@@ -491,6 +516,242 @@ def _ensure_disposable_loaded() -> set[str]:
 
 
 # ---------------------------------------------------------------------------
+# Popular domains + free-email domains (static JSON assets, loaded once).
+# Used by the syntax-suggestion feature (Levenshtein via difflib) and by the
+# is_free_email flag. Both files ship in data/ and are pure ASCII.
+# ---------------------------------------------------------------------------
+_popular_domains_lock = threading.Lock()
+_popular_domains: list[str] | None = None
+_free_email_domains: set[str] | None = None
+
+
+def _load_popular_domains() -> list[str]:
+    """Load the curated popular-domain list (lowercased, deduped, order-preserving).
+
+    Returns a list (NOT a set) because difflib.get_close_matches needs an
+    iterable of candidates. Degrades to a small built-in set if the file is
+    missing/corrupt.
+    """
+    global _popular_domains
+    with _popular_domains_lock:
+        if _popular_domains is not None:
+            return _popular_domains
+        try:
+            with open(POPULAR_DOMAINS_FILE, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+            seen: set[str] = set()
+            ordered: list[str] = []
+            for d in data:
+                d = str(d).strip().lower()
+                if d and d not in seen:
+                    seen.add(d)
+                    ordered.append(d)
+            _popular_domains = ordered or _FALLBACK_POPULAR_DOMAINS
+        except Exception:
+            _popular_domains = _FALLBACK_POPULAR_DOMAINS
+        return _popular_domains
+
+
+def _load_free_email_domains() -> set[str]:
+    """Load the free-email-domain set (lowercased) for the is_free_email flag."""
+    global _free_email_domains
+    with _popular_domains_lock:
+        if _free_email_domains is not None:
+            return _free_email_domains
+        try:
+            with open(FREE_EMAIL_DOMAINS_FILE, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+            _free_email_domains = {str(d).strip().lower() for d in data if str(d).strip()}
+        except Exception:
+            _free_email_domains = set(_FALLBACK_FREE_EMAIL_DOMAINS)
+        return _free_email_domains
+
+
+# Minimal built-in fallbacks used only if the JSON files are missing/corrupt.
+_FALLBACK_POPULAR_DOMAINS: list[str] = [
+    "gmail.com", "yahoo.com", "outlook.com", "hotmail.com", "aol.com",
+    "icloud.com", "proton.me", "protonmail.com", "mail.ru", "yandex.ru",
+    "zoho.com", "gmx.com", "web.de", "live.com", "msn.com", "me.com",
+    "mac.com", "tutanota.com", "tuta.io", "fastmail.com",
+]
+_FALLBACK_FREE_EMAIL_DOMAINS: list[str] = list(_FALLBACK_POPULAR_DOMAINS)
+
+
+def _is_free_email_domain(domain: str) -> bool:
+    """True when the domain is in the free-email set (gmail/yahoo/outlook/...)."""
+    free = _load_free_email_domains()
+    return domain.strip().lower() in free
+
+
+# ---------------------------------------------------------------------------
+# MX-based provider identification
+# ---------------------------------------------------------------------------
+# Map provider-id -> list of suffix patterns matched against MX exchange hosts.
+# Order matters: we walk the patterns in declared order and return the first
+# match. Patterns are lowercased suffix matches (host.endswith(pattern)).
+_PROVIDER_MX_PATTERNS: list[tuple[str, tuple[str, ...]]] = [
+    ("googleworkspace", (
+        "l.google.com",
+        ".google.com",
+        "googlemail.com",
+    )),
+    ("microsoft365", (
+        ".mail.protection.outlook.com",
+        ".outlook.com",
+        ".office365.com",
+    )),
+    ("protonmail", (
+        ".protonmail.ch",
+        ".proton.me",
+        "mail.protonmail.ch",
+    )),
+    ("zoho", (
+        ".zoho.com",
+        "mx.zoho.com",
+    )),
+    ("yandex", (
+        ".yandex.ru",
+        ".yandex.net",
+    )),
+    ("mailru", (
+        ".mail.ru",
+        "emx.mail.ru",
+    )),
+    ("amazon_ses", (
+        ".amazonses.com",
+        "feedback-smtp.amazonses.com",
+    )),
+    ("sendgrid", (
+        ".sendgrid.net",
+    )),
+]
+
+
+def _identify_email_provider(mx: dict[str, Any] | None) -> str | None:
+    """Classify the backend mail provider from MX records.
+
+    Returns one of: googleworkspace, microsoft365, protonmail, zoho, yandex,
+    mailru, amazon_ses, sendgrid, other (MX present but unrecognized), or
+    None (no MX records).
+    """
+    if not mx:
+        return None
+    if not mx.get("has_mx"):
+        # A-record fallback means the domain hosts its own mail; we can't
+        # classify the provider from an A record.
+        return None if mx.get("fallback_a") else None
+    records = mx.get("records") or []
+    exchanges = [str(r.get("exchange", "")).rstrip(".").lower() for r in records]
+    if not exchanges:
+        return None
+    for provider, patterns in _PROVIDER_MX_PATTERNS:
+        for host in exchanges:
+            for pat in patterns:
+                if host == pat or host.endswith(pat):
+                    return provider
+    # MX present but no pattern matched.
+    return "other"
+
+
+# ---------------------------------------------------------------------------
+# Syntax suggestion via Levenshtein (difflib.get_close_matches)
+# ---------------------------------------------------------------------------
+def _suggest_correction(email: str, syntax: dict[str, Any]) -> str | None:
+    """Return a suggested corrected email when the domain looks like a typo
+    of a popular provider. Used on the syntax-INVALID path where the regex
+    rejected the address but we can still split on '@' and try to correct.
+
+    Returns the full corrected email (e.g. "alice@gmail.com") or None.
+    """
+    if syntax.get("valid"):
+        return None
+    raw = email.strip().lower()
+    if "@" not in raw:
+        return None
+    local, _, domain = raw.rpartition("@")
+    if not local or not domain:
+        return None
+    if " " in domain or "/" in domain:
+        return None
+    return _suggest_correction_for_domain(local, domain)
+
+
+def _suggest_correction_for_domain(local: str, domain: str) -> str | None:
+    """Given a local part and a domain, return a corrected email if the
+    domain is within Levenshtein distance ~2 of a popular provider.
+
+    Skips the lookup when the domain IS already a popular/free domain (no
+    point suggesting gmail.com for gmail.com). Uses difflib's similarity
+    ratio with a 0.8 cutoff (corresponds to distance 1-2 for short domains).
+    """
+    domain = domain.strip().lower()
+    if not domain:
+        return None
+    popular = _load_popular_domains()
+    if domain in popular:
+        return None
+    # Also skip when the domain is already a known free-email domain (overlap
+    # with popular but the free set is slightly different).
+    if _is_free_email_domain(domain):
+        return None
+    matches = difflib.get_close_matches(
+        domain,
+        popular,
+        n=SUGGESTION_N,
+        cutoff=SUGGESTION_CUTOFF,
+    )
+    if not matches:
+        return None
+    suggested_domain = matches[0]
+    if suggested_domain == domain:
+        return None
+    return f"{local.strip().lower()}@{suggested_domain}"
+
+
+# ---------------------------------------------------------------------------
+# Greylisting-aware SMTP RCPT. Wraps _smtp_rcpt with one 451 retry.
+# ---------------------------------------------------------------------------
+def _smtp_rcpt_with_greylisting(
+    email: str,
+    mx_host: str,
+    timeout: int = SMTP_TIMEOUT,
+) -> tuple[dict[str, Any], bool, str | None]:
+    """Run _smtp_rcpt and, on a 451 temporary failure, retry once after
+    GREYLIST_WAIT_SECONDS.
+
+    Returns (smtp_result, is_greylisted, greylisting_note).
+      - smtp_result: the final _smtp_rcpt dict (last attempt).
+      - is_greylisted: True only when BOTH attempts returned 451.
+        False when the retry succeeded (250/251) or when no 451 happened.
+        None when SMTP did not run (caller should treat as "not checked").
+      - greylisting_note: a plain-English explanation string when
+        is_greylisted is True, else None.
+
+    We never retry more than once. The 5s wait is the standard short
+    greylisting window; combined with the SMTP timeout this means a worst
+    case of ~timeout + 5s + ~timeout for the SMTP stage (e.g. 25s).
+    """
+    first = _smtp_rcpt(email, mx_host, timeout=timeout)
+    code = first.get("smtp_code")
+    if code != GREYLIST_SMTP_CODE:
+        # No temporary failure -> no greylisting concern.
+        return first, False, None
+    # 451 received -> wait once, retry once.
+    time.sleep(GREYLIST_WAIT_SECONDS)
+    second = _smtp_rcpt(email, mx_host, timeout=timeout)
+    second_code = second.get("smtp_code")
+    if second_code == GREYLIST_SMTP_CODE:
+        # Still 451 after a polite retry -> greylisted.
+        note = (
+            "This domain uses greylisting - temporary rejection of incoming "
+            "mail. The mailbox may still be valid; retry later."
+        )
+        return second, True, note
+    # Retry succeeded (or returned a different code) -> not greylisted.
+    return second, False, None
+
+
+# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 class APIError(Exception):
@@ -684,7 +945,7 @@ async def api_error_handler(request: Request, exc: APIError):
 async def root():
     return {
         "name": "Email Validator API",
-        "version": "2.1.0",
+        "version": "2.2.0",
         "endpoints": {
             "validate": "/validate?email=user@example.com&smtp=true&catch_all=true&breach=true",
             "health": "/health",
@@ -692,6 +953,10 @@ async def root():
         "features": [
             "syntax", "mx", "smtp", "disposable", "catch_all", "role",
             "breach_status (Have I Been Pwned, CC BY 4.0)",
+            "syntax_suggestion (Levenshtein, did-you-mean)",
+            "is_free_email (free-provider flag)",
+            "email_provider (MX-based: googleworkspace/microsoft365/protonmail/...)",
+            "is_greylisted (SMTP 451 retry detection)",
         ],
         "docs": "/docs",
     }
@@ -756,6 +1021,12 @@ async def validate(
     # Stage 1: syntax
     syntax = _validate_syntax(addr)
     if not syntax["valid"]:
+        # Syntax suggestion: only attempt when syntax is invalid AND the
+        # domain looks like a typo of a popular provider.
+        suggestion = _suggest_correction(addr, syntax)
+        is_free_email = False
+        if syntax.get("domain"):
+            is_free_email = _is_free_email_domain(syntax["domain"])
         breach_status, breach_error, links = _build_breach_block(addr, breach)
         return {
             "email": addr,
@@ -769,7 +1040,11 @@ async def validate(
             "is_role": False,
             "role_type": None,
             "score": 0,
-            "suggestion": None,
+            "suggestion": suggestion,
+            "is_free_email": is_free_email,
+            "email_provider": None,
+            "is_greylisted": None,
+            "greylisting_note": None,
             "breach_status": breach_status,
             "breach_status_error": breach_error,
             "is_trusted_identity": None,
@@ -786,10 +1061,24 @@ async def validate(
     # Disposable + role detection are cheap; always run them.
     is_disposable = _is_disposable_domain(domain)
     is_role, role_type = _is_role_account(local)
+    # Free-email flag is cheap (set lookup); always run it.
+    is_free_email = _is_free_email_domain(domain)
+
+    # Syntax suggestion: attempt when the domain is NOT already a popular
+    # domain (no point suggesting gmail.com for gmail.com) and looks like a
+    # typo of one. We attempt this on valid-syntax emails whose domain is
+    # not in the popular list, since e.g. alice@gmial.com IS syntactically
+    # valid but has no MX (gmial.com is unregistered). The suggestion gives
+    # the caller a "did you mean" hint.
+    suggestion = None
+    if not is_free_email:
+        suggestion = _suggest_correction_for_domain(local, domain)
 
     # Stage 2: MX lookup
     mx = _lookup_mx(domain)
     mx_found = bool(mx["has_mx"] or mx.get("fallback_a"))
+    # Provider identification from MX records (None when no MX / A fallback).
+    email_provider = _identify_email_provider(mx)
     if not mx_found:
         score = _compute_score(
             syntax_valid=True,
@@ -812,7 +1101,11 @@ async def validate(
             "is_role": is_role,
             "role_type": role_type,
             "score": score,
-            "suggestion": None,
+            "suggestion": suggestion,
+            "is_free_email": is_free_email,
+            "email_provider": email_provider,
+            "is_greylisted": None,
+            "greylisting_note": None,
             "breach_status": breach_status,
             "breach_status_error": breach_error,
             "is_trusted_identity": _compute_is_trusted_identity(None, is_disposable, breach_status),
@@ -823,18 +1116,23 @@ async def validate(
             "fetched_at": datetime.now(timezone.utc).isoformat(),
         }
 
-    # Stage 3: SMTP verify (optional)
+    # Stage 3: SMTP verify (optional) with greylisting retry
     smtp_result = None
     smtp_verified: bool | None = None
     is_catch_all: bool | None = None
     catch_all_probe = None
+    is_greylisted: bool | None = None
+    greylisting_note: str | None = None
     if smtp and mx.get("best"):
-        smtp_result = _smtp_rcpt(addr, mx["best"])
+        smtp_result, is_greylisted, greylisting_note = _smtp_rcpt_with_greylisting(
+            addr, mx["best"]
+        )
         smtp_verified = smtp_result.get("accepts")
         # Catch-all probe only when SMTP check is enabled and the mailbox
         # was accepted (if the real mailbox was rejected, the domain clearly
-        # is not accepting everything; skip the extra call).
-        if catch_all and smtp_verified:
+        # is not accepting everything; skip the extra call). Also skip the
+        # probe when greylisting is active - the probe would just hit 451 too.
+        if catch_all and smtp_verified and not is_greylisted:
             catch_all_probe = _detect_catch_all(domain, mx["best"])
             is_catch_all = catch_all_probe.get("is_catch_all")
         elif catch_all and smtp_verified is False:
@@ -842,11 +1140,15 @@ async def validate(
             is_catch_all = False
 
     valid = syntax["valid"] and mx_found
-    if smtp_verified is False:
+    if smtp_verified is False and not is_greylisted:
+        # Mailbox definitively rejected (not a 451 greylisting case).
         valid = False
     # If catch-all detected, the real SMTP "accepts" is unreliable; we keep
     # valid=True (the address is syntactically valid and the domain accepts
     # mail) but expose is_catch_all so the caller can decide.
+    # If greylisted, the 451 is a temporary failure, NOT a definitive
+    # rejection - we keep valid=True (domain accepts mail) and surface
+    # is_greylisted so the caller can decide to retry later.
 
     score = _compute_score(
         syntax_valid=True,
@@ -857,10 +1159,9 @@ async def validate(
         is_role=is_role,
     )
 
-    suggestion = None
-    # Disposable domains are valid emails but low-quality for marketing.
-    # We surface a suggestion flag via the score; no typo correction yet.
-
+    # Syntax suggestion already computed above (before MX lookup). Valid
+    # emails with a popular-domain typo keep their suggestion; valid emails
+    # on a real domain have suggestion=None.
     # Stage 4: breach status (optional, additive). Run after the core
     # pipeline so a slow/timing-out HIBP call never blocks bounce validation.
     breach_status, breach_error, links = _build_breach_block(addr, breach)
@@ -881,6 +1182,10 @@ async def validate(
         "role_type": role_type,
         "score": score,
         "suggestion": suggestion,
+        "is_free_email": is_free_email,
+        "email_provider": email_provider,
+        "is_greylisted": is_greylisted,
+        "greylisting_note": greylisting_note,
         "breach_status": breach_status,
         "breach_status_error": breach_error,
         "is_trusted_identity": is_trusted_identity,
