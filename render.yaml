@@ -8,3 +8,7 @@
     envVars:
       - key: PYTHON_VERSION
         value: 3.13.2
+      - key: HIBP_API_KEY
+        sync: false  # set manually on Render dashboard
+    healthCheckPath: /health
+    autoDeploy: true
