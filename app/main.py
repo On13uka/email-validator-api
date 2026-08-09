@@ -37,9 +37,15 @@ from pathlib import Path
 from typing import Any
 
 import dns.resolver
-from fastapi import FastAPI, Query, Request
+from fastapi import Body, FastAPI, Query, Request
 from fastapi.responses import JSONResponse
 from contextlib import asynccontextmanager
+
+from . import breach_alerts
+from . import circuit_breaker
+from . import headers
+from . import identity_graph
+from . import idempotency
 
 
 @asynccontextmanager
@@ -62,6 +68,10 @@ app = FastAPI(
     version="2.2.0",
     lifespan=_lifespan,
 )
+
+# v1.4: Idempotency key middleware for POST endpoints.
+app.middleware("http")(idempotency.idempotency_middleware)
+app.middleware("http")(headers.headers_middleware)
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -247,6 +257,7 @@ def _write_breach_cache(email: str, payload: dict[str, Any]) -> None:
         tmp = path.with_suffix(".json.tmp")
         record = {
             "fetched_at": datetime.now(timezone.utc).isoformat(),
+            "version": "2.2.0",
             "payload": payload,
         }
         with open(tmp, "w", encoding="utf-8") as fh:
@@ -279,6 +290,9 @@ def _summarize_breaches(breaches: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+_hibp_breaker = circuit_breaker.CircuitBreaker(name="hibp", failure_threshold=3, cooldown_seconds=300)
+
+
 def _fetch_hibp_breach(email: str) -> dict[str, Any]:
     """Call HIBP breachedaccount/{email} and return a breach_status payload.
 
@@ -287,13 +301,12 @@ def _fetch_hibp_breach(email: str) -> dict[str, Any]:
     could not produce a clean result. The caller wraps this into the final
     breach_status response shape.
 
-    Status code semantics (HIBP API v3):
-      200 -> breached; array of breach objects.
-      404 -> NOT breached (this is the good/no-breach case).
-      401/403 -> invalid/missing API key.
-      429 -> rate limited (honor Retry-After header).
-      other/timeout -> degraded.
+    Uses a circuit breaker: after 3 consecutive failures, enters fallback
+    mode for 5 minutes, returning "unavailable" instead of timing out.
     """
+    if _hibp_breaker.is_open():
+        return {"error": "HIBP temporarily unavailable (circuit breaker open)"}
+
     import urllib.request
     import urllib.error
     import urllib.parse
@@ -317,10 +330,12 @@ def _fetch_hibp_breach(email: str) -> dict[str, Any]:
         breaches = json.loads(raw) if raw else []
         if not isinstance(breaches, list):
             breaches = []
+        _hibp_breaker.record_success()
         return _summarize_breaches(breaches)
     except urllib.error.HTTPError as e:
         if e.code == 404:
             # Not breached - this is a clean "no breaches" result.
+            _hibp_breaker.record_success()
             return {
                 "breached": False,
                 "breach_count": 0,
@@ -329,6 +344,7 @@ def _fetch_hibp_breach(email: str) -> dict[str, Any]:
                 "last_breach_date": None,
             }
         if e.code in (401, 403):
+            _hibp_breaker.record_failure()
             return {"error": "HIBP_API_KEY invalid or unauthorized"}
         if e.code == 429:
             retry_after = e.headers.get("Retry-After") if e.headers else None
@@ -338,6 +354,7 @@ def _fetch_hibp_breach(email: str) -> dict[str, Any]:
             return out
         return {"error": f"HIBP HTTP {e.code}"}
     except (urllib.error.URLError, TimeoutError, socket.timeout):
+        _hibp_breaker.record_failure()
         return {"error": "HIBP request timed out"}
     except (json.JSONDecodeError, ValueError):
         return {"error": "HIBP response parse error"}
@@ -773,6 +790,32 @@ def _validate_syntax(email: str) -> dict[str, Any]:
     return {"valid": True, "local": local, "domain": domain}
 
 
+def _normalize_email(local: str, domain: str) -> tuple[str, bool]:
+    """Normalize an email address by stripping plus-addressing and Gmail dots.
+
+    Returns (normalized_email, is_plus_addressed).
+
+    Rules:
+    - Strip plus-addressing: "john+spam@gmail.com" -> "john@gmail.com"
+    - For Gmail only: remove dots in local part: "j.o.h.n@gmail.com" -> "john@gmail.com"
+      (Gmail ignores dots; other providers do not)
+    - Detect plus-addressing: set is_plus_addressed=True if "+" present
+
+    This enables user dedup across signups (the same person using
+    john+newsletter@gmail.com and john+promo@gmail.com is the same Gmail
+    mailbox).
+    """
+    is_plus_addressed = "+" in local
+    # Strip plus-addressing
+    if is_plus_addressed:
+        local = local.split("+", 1)[0]
+    # Gmail dot normalization (Gmail ignores dots in the local part)
+    if domain in ("gmail.com", "googlemail.com"):
+        local = local.replace(".", "")
+    normalized = f"{local}@{domain}"
+    return normalized, is_plus_addressed
+
+
 def _lookup_mx(domain: str) -> dict[str, Any]:
     try:
         answers = dns.resolver.resolve(domain, "MX", lifetime=10)
@@ -831,23 +874,42 @@ def _random_local_part(length: int = 22) -> str:
     return "zzztestnotreal" + head + tail
 
 
+_CATCH_ALL_CACHE: dict[str, dict[str, Any]] = {}
+_CATCH_ALL_CACHE_TTL = 24 * 60 * 60  # 24 hours
+
+
 def _detect_catch_all(domain: str, mx_host: str) -> dict[str, Any]:
     """Probe whether mx_host accepts a random fake mailbox for `domain`.
 
-    Adds one extra SMTP call. On timeout/error degrades to is_catch_all=null
-    rather than blocking the whole request.
+    Adds one extra SMTP call. Results are cached per-domain for 24 hours
+    so repeat checks on the same domain are instant. On timeout/error
+    degrades to is_catch_all=null rather than blocking the whole request.
     """
+    import time
+    d = domain.strip().lower()
+    now = time.time()
+    cached = _CATCH_ALL_CACHE.get(d)
+    if cached and now - cached.get("_cached_at", 0) < _CATCH_ALL_CACHE_TTL:
+        result = dict(cached)
+        result.pop("_cached_at", None)
+        result["catch_all_cached"] = True
+        return result
+
     fake_local = _random_local_part()
     fake_addr = f"{fake_local}@{domain}"
     probe = _smtp_rcpt(fake_addr, mx_host, timeout=CATCH_ALL_TIMEOUT)
     accepts = probe.get("accepts")
     if accepts is None:
-        # Timeout / connection error - cannot determine.
         return {"is_catch_all": None, "probe": probe, "probe_address": fake_addr}
     if accepts:
-        # SMTP accepted a guaranteed-fake mailbox -> catch-all / accept-all.
-        return {"is_catch_all": True, "probe": probe, "probe_address": fake_addr}
-    return {"is_catch_all": False, "probe": probe, "probe_address": fake_addr}
+        result = {"is_catch_all": True, "probe": probe, "probe_address": fake_addr}
+    else:
+        result = {"is_catch_all": False, "probe": probe, "probe_address": fake_addr}
+    # Cache the result
+    cached_entry = dict(result)
+    cached_entry["_cached_at"] = now
+    _CATCH_ALL_CACHE[d] = cached_entry
+    return result
 
 
 def _is_role_account(local_part: str) -> tuple[bool, str | None]:
@@ -860,9 +922,40 @@ def _is_role_account(local_part: str) -> tuple[bool, str | None]:
     return False, None
 
 
+_KNOWN_DISPOSABLE_MX = {
+    "mailinator.com", "guerrillamail.com", "guerrillamailblock.com",
+    "sharklasers.com", "spam4.me", "dispostable.com", "tempmail.net",
+    "throwam.com", "getnada.com", "mailnesia.com", "temp-mail.org",
+    "fakeinbox.com", "10minutemail.com", "yopmail.com", "mohmal.com",
+    "tempinbox.com", "maildrop.cc", "discard.email", "mailcatch.com",
+}
+
+_DISPOSABLE_MX_CACHE: dict[str, bool] = {}
+
+
 def _is_disposable_domain(domain: str) -> bool:
+    """Check if domain is disposable. Uses static list + real-time MX check."""
     domains = _ensure_disposable_loaded()
-    return domain.strip().lower() in domains
+    d = domain.strip().lower()
+    if d in domains:
+        _DISPOSABLE_MX_CACHE[d] = True
+        return True
+    # Real-time MX-based check: if MX points to a known disposable provider
+    if d in _DISPOSABLE_MX_CACHE:
+        return _DISPOSABLE_MX_CACHE[d]
+    try:
+        import dns.resolver
+        answers = dns.resolver.resolve(d, "MX", lifetime=3)
+        for r in answers:
+            mx = str(r.exchange).rstrip(".").lower()
+            for disposable_mx in _KNOWN_DISPOSABLE_MX:
+                if mx == disposable_mx or mx.endswith("." + disposable_mx):
+                    _DISPOSABLE_MX_CACHE[d] = True
+                    return True
+    except Exception:
+        pass
+    _DISPOSABLE_MX_CACHE[d] = False
+    return False
 
 
 def _compute_score(
@@ -916,6 +1009,59 @@ def _normalize(email: str) -> str:
     return email
 
 
+def _compose_invalid_explanation(
+    *,
+    valid: bool,
+    stage: str,
+    syntax: dict[str, Any] | None = None,
+    mx_found: bool | None = None,
+    smtp_verified: bool | None = None,
+    is_disposable: bool = False,
+    is_catch_all: bool | None = None,
+    is_greylisted: bool | None = None,
+    breach_status: dict[str, Any] | None = None,
+    breach_error: str | None = None,
+) -> str | None:
+    """Plain-English explanation of why an email is invalid (P3.1).
+
+    Returns None when the email is valid. Composed from the same signals
+    that drive the score so the explanation always matches the verdict.
+    """
+    if valid:
+        return None
+
+    reasons: list[str] = []
+
+    if stage == "syntax":
+        reason = "syntax error"
+        if syntax and syntax.get("reason"):
+            reason = syntax["reason"]
+        reasons.append(f"syntax invalid ({reason})")
+    elif stage == "mx":
+        reasons.append("MX lookup failed (domain does not accept mail)")
+    elif stage in ("smtp", "mx") and smtp_verified is False:
+        if is_greylisted:
+            reasons.append("mailbox greylisted (temporary rejection)")
+        else:
+            reasons.append("SMTP mailbox rejected")
+
+    if is_disposable:
+        reasons.append("disposable domain")
+    if is_catch_all is True:
+        reasons.append("catch-all domain (accepts any mailbox)")
+
+    if breach_status and isinstance(breach_status, dict):
+        count = breach_status.get("breach_count")
+        if isinstance(count, int) and count > 0:
+            reasons.append(f"{count} breach{'es' if count != 1 else ''}")
+    elif breach_error:
+        reasons.append(f"breach lookup failed ({breach_error})")
+
+    if not reasons:
+        return "Invalid email."
+    return "Invalid: " + " + ".join(reasons)
+
+
 # ---------------------------------------------------------------------------
 # Startup: warm the disposable cache in a background thread so the first
 # request is not penalized by the ~100k-domain download.
@@ -932,9 +1078,21 @@ def _warm_disposable_cache_worker() -> None:
 # ---------------------------------------------------------------------------
 @app.exception_handler(APIError)
 async def api_error_handler(request: Request, exc: APIError):
+    import uuid as _uuid
+    request_id = request.headers.get("x-request-id") or str(_uuid.uuid4())
+    retry_after = 60 if exc.status_code == 429 else None
     return JSONResponse(
         status_code=exc.status_code,
-        content={"error": {"code": exc.code, "message": exc.message}},
+        content={
+            "error": {
+                "code": exc.code,
+                "message": exc.message,
+                "retry_after": retry_after,
+                "docs_url": "https://github.com/On13uka/email-validator-api#readme",
+                "request_id": request_id,
+            }
+        },
+        headers={"X-Request-Id": request_id},
     )
 
 
@@ -1045,6 +1203,8 @@ async def validate(
             "email_provider": None,
             "is_greylisted": None,
             "greylisting_note": None,
+            "normalized_email": None,
+            "is_plus_addressed": None,
             "breach_status": breach_status,
             "breach_status_error": breach_error,
             "is_trusted_identity": None,
@@ -1053,10 +1213,14 @@ async def validate(
             "smtp": None,
             "_links": links,
             "fetched_at": datetime.now(timezone.utc).isoformat(),
+            "version": "2.2.0",
         }
 
     local = syntax["local"]
     domain = syntax["domain"]
+
+    # v1.4: normalize email (strip plus-addressing, Gmail dots) for dedup.
+    normalized_email, is_plus_addressed = _normalize_email(local, domain)
 
     # Disposable + role detection are cheap; always run them.
     is_disposable = _is_disposable_domain(domain)
@@ -1114,6 +1278,7 @@ async def validate(
             "smtp": None,
             "_links": links,
             "fetched_at": datetime.now(timezone.utc).isoformat(),
+            "version": "2.2.0",
         }
 
     # Stage 3: SMTP verify (optional) with greylisting retry
@@ -1181,18 +1346,98 @@ async def validate(
         "is_role": is_role,
         "role_type": role_type,
         "score": score,
+        "deliverability": {
+            "score": score,
+            "factors": {
+                "syntax_valid": True,
+                "mx_found": mx_found,
+                "smtp_verified": smtp_verified,
+                "is_disposable": is_disposable,
+                "is_catch_all": is_catch_all,
+                "is_greylisted": is_greylisted,
+                "breach_count": breach_status.get("breach_count", 0) if breach_status else 0,
+            },
+        },
         "suggestion": suggestion,
         "is_free_email": is_free_email,
         "email_provider": email_provider,
         "is_greylisted": is_greylisted,
         "greylisting_note": greylisting_note,
+        "normalized_email": normalized_email,
+        "is_plus_addressed": is_plus_addressed,
         "breach_status": breach_status,
         "breach_status_error": breach_error,
         "is_trusted_identity": is_trusted_identity,
+        "invalid_explanation": _compose_invalid_explanation(
+            valid=valid,
+            stage="smtp" if smtp_result else "mx",
+            syntax=syntax,
+            mx_found=mx_found,
+            smtp_verified=smtp_verified,
+            is_disposable=is_disposable,
+            is_catch_all=is_catch_all,
+            is_greylisted=is_greylisted,
+            breach_status=breach_status,
+            breach_error=breach_error,
+        ) if not valid else None,
         "syntax": syntax,
         "mx": mx,
         "smtp": smtp_result,
         "catch_all_probe": catch_all_probe,
         "_links": links,
+        "identity_graph": identity_graph.build_identity_graph(addr, domain, breach_status) if valid else None,
+        "provenance": {
+            "syntax": {"source": "internal", "confidence": 1.0},
+            "mx": {"source": "DNS resolver", "confidence": 0.95},
+            "smtp_verified": {"source": "SMTP probe", "confidence": 0.90},
+            "breach_status": {"source": "Have I Been Pwned", "confidence": 0.95},
+        },
         "fetched_at": datetime.now(timezone.utc).isoformat(),
     }
+
+
+# --------------------------------------------------------------------------- #
+# v2.3: Breach alert monitoring (P5.19)
+# --------------------------------------------------------------------------- #
+
+@app.post("/alerts/breach")
+async def register_breach_alert(payload: dict[str, Any] = Body(...)):
+    """Register an email for breach monitoring. When a new breach appears,
+    the API POSTs a webhook payload to the registered URL.
+
+    Body: {"email": "user@example.com", "webhook_url": "https://...", "webhook_secret": "..."}
+    """
+    email = (payload.get("email") or "").strip().lower()
+    if not email or "@" not in email:
+        return JSONResponse(status_code=422, content={"error": {"code": "invalid_email", "message": "a valid email is required"}})
+    webhook_url = payload.get("webhook_url")
+    webhook_secret = payload.get("webhook_secret")
+    alert = breach_alerts.register_alert(email, webhook_url, webhook_secret)
+    return alert
+
+
+@app.get("/alerts/breach/{alert_id}")
+async def get_breach_alert(alert_id: str):
+    """Get the status and history of a breach alert subscription."""
+    alert = breach_alerts.get_alert(alert_id)
+    if not alert:
+        return JSONResponse(status_code=404, content={"error": {"code": "not_found", "message": "alert not found"}})
+    return alert
+
+
+@app.delete("/alerts/breach/{alert_id}")
+async def delete_breach_alert(alert_id: str):
+    """Cancel a breach alert subscription."""
+    if breach_alerts.delete_alert(alert_id):
+        return {"deleted": True, "alert_id": alert_id}
+    return JSONResponse(status_code=404, content={"error": {"code": "not_found", "message": "alert not found"}})
+
+
+@app.post("/alerts/breach/run")
+async def run_breach_alerts():
+    """Run the breach alert check cycle. Cron-callable.
+
+    For each registered alert, queries HIBP and fires a webhook if a new
+    breach appeared since the last check.
+    """
+    return breach_alerts.run_check_cycle()
